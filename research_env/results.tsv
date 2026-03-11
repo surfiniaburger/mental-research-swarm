@@ -1,13 +1,7 @@
-commit	val_bpb	memory_gb	status	description
-baseline	1.452187	0.0	keep	Experiment run
-baseline	0.0	0.0	crash	Experiment run
-baseline	0.0	0.0	crash	Experiment run
-baseline	0.0	0.0	crash	Experiment run
-baseline	1.425723	0.0	keep	Experiment run
-baseline	1.41206	0.0	keep	Experiment run
-baseline	1.500046	0.0	keep	Experiment run
-baseline	1.439051	0.0	keep	Experiment run
-baseline	1.45782	0.0	keep	Experiment run
-baseline	1.420785	0.0	keep	Experiment run
-baseline	1.42059	0.0	keep	Experiment run
-baseline	1.418264	0.0	keep	Experiment run
+commitval_bpbmemory_gbstatusdescription
+baseline	1.435149	0.0	keep	Experiment run
+baseline	1.436977	0.0	keep	Experiment run
+baseline	1.450276	0.0	keep	Experiment run
+baseline	1.447446	0.0	keep	Experiment run
+baseline	1.424063	0.0	keep	Experiment run
+baseline	1.428233	0.0	keep	Experiment run

@@ -115,4 +115,4 @@ As an example use case, a user might leave you running while they sleep. If each
 
 ## Research Insights
 
-LLM Analysis failed: litellm.APIConnectionError: OllamaException - {"StatusCode":429,"Status":"429 Too Many Requests","error":"you (adedoyinsola) have reached your weekly usage limit, upgrade for higher limits: https://ollama.com/upgrade"}. Falling back to manual review.
+- Increase learning rate to 0.04
