@@ -1,11 +1,12 @@
 import logging
 import asyncio
+import os
 from datetime import datetime
 from typing import AsyncGenerator
 from google.adk.agents import BaseAgent, LlmAgent
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events import Event
-from .agents import ResearchAgent, SkillWriterAgent
+from .agents import ResearchAgent, SkillWriterAgent, CriticAgent, ManagerAgent
 
 logger = logging.getLogger("swarm.coordinator")
 
@@ -22,23 +23,20 @@ class SwarmCoordinator(BaseAgent):
     this coordinator interleaves LLM inference WITH real
     experiment execution via the protocol drivers.
     """
-    research_agent: ResearchAgent
-    skill_writer: SkillWriterAgent
+    manager_agent: ManagerAgent
     max_iterations: int = 100
     model_config = {"arbitrary_types_allowed": True}
 
     def __init__(
         self,
         name: str,
-        research_agent: ResearchAgent,
-        skill_writer: SkillWriterAgent,
+        manager_agent: ManagerAgent,
         max_iterations: int = 100
     ):
         super().__init__(
             name=name,
-            sub_agents=[skill_writer, research_agent],
-            research_agent=research_agent,
-            skill_writer=skill_writer,
+            sub_agents=[manager_agent],
+            manager_agent=manager_agent,
             max_iterations=max_iterations
         )
 
@@ -48,17 +46,25 @@ class SwarmCoordinator(BaseAgent):
         logger.info("  PHASE 1: ENVIRONMENT SETUP")
         logger.info("═" * 60)
         
-        success = await self.research_agent.driver.ensure_setup()
+        success = await self.manager_agent.hands.driver.ensure_setup()
         if not success:
             logger.error("❌ Environment initialization FAILED.")
             return
         logger.info("✅ Environment initialized.")
 
+        # Ensure docs directory exists
+        repo_path = self.manager_agent.hands.driver.repo_path
+        docs_dir = os.path.join(repo_path, "docs")
+        os.makedirs(docs_dir, exist_ok=True)
+        
+        # Inject context for ManagerAgent
+        ctx.session.state["research_dir"] = repo_path
+
         # Load initial files into session state
-        ctx.session.state["program_md"] = await self.research_agent.driver.mcp.call_tool(
+        ctx.session.state["program_md"] = await self.manager_agent.hands.driver.mcp.call_tool(
             "read_research_file", {"path": "program.md"}
         )
-        ctx.session.state["train_py"] = await self.research_agent.driver.mcp.call_tool(
+        ctx.session.state["train_py"] = await self.manager_agent.hands.driver.mcp.call_tool(
             "read_research_file", {"path": "train.py"}
         )
 
@@ -67,16 +73,16 @@ class SwarmCoordinator(BaseAgent):
         logger.info("  PHASE 2: BASELINE EXPERIMENT")
         logger.info("═" * 60)
         
-        baseline = await self.research_agent.driver.run_experiment("baseline-reset")
-        await self.research_agent.driver.log_result(baseline)
+        baseline = await self.manager_agent.hands.driver.run_experiment("baseline-reset")
+        await self.manager_agent.hands.driver.log_result(baseline)
         ctx.session.state["latest_bpb"] = baseline.val_bpb
         logger.info(f"📊 Baseline: val_bpb={baseline.val_bpb} | status={baseline.status}")
 
         # Reload train.py and results after baseline
-        ctx.session.state["train_py"] = await self.research_agent.driver.mcp.call_tool(
+        ctx.session.state["train_py"] = await self.manager_agent.hands.driver.mcp.call_tool(
             "read_research_file", {"path": "train.py"}
         )
-        ctx.session.state["results_tsv"] = await self.research_agent.driver.mcp.call_tool(
+        ctx.session.state["results_tsv"] = await self.manager_agent.hands.driver.mcp.call_tool(
             "read_research_file", {"path": "results.tsv"}
         )
 
@@ -92,74 +98,100 @@ class SwarmCoordinator(BaseAgent):
             logger.info(f"  🔄 ITERATION {iteration}/{self.max_iterations}")
             logger.info("─" * 60)
 
-            # ── Step A: TheBrain analyzes and proposes ────────────
-            logger.info(f"  🧠 [{self.skill_writer.name}] Analyzing results & proposing strategy...")
-            
-            async for event in self.skill_writer.run_async(ctx):
-                yield event
+            try:
+                # ── Steps A, B, C: Hierarchical Management ────────────
+                logger.info(f"  🏢 [{self.manager_agent.name}] Delegating iteration tasks...")
                 
-            brain_output = ctx.session.state.get(self.skill_writer.output_key, "")
-            if brain_output:
-                logger.info(f"  📝 TheBrain proposal: {brain_output[:150].replace(chr(10), ' ')}...")
-                # Update program.md with the new insights
-                await self.skill_writer.driver.update_skill(brain_output)
-                # Reload program.md into state
-                ctx.session.state["program_md"] = await self.research_agent.driver.mcp.call_tool(
-                    "read_research_file", {"path": "program.md"}
-                )
-                logger.info("  ✅ program.md updated with new insights.")
-            else:
-                logger.warning("  ⚠️ TheBrain returned empty output, skipping skill update.")
+                max_retries = 3
+                current_retry = 0
+                while current_retry < max_retries:
+                    try:
+                        async for event in self.manager_agent.run_async(ctx):
+                            yield event
+                        break # Success
+                    except Exception as e:
+                        if "Timeout" in str(e) or "APIConnectionError" in str(e):
+                            current_retry += 1
+                            wait_time = 2 ** current_retry
+                            logger.warning(f"  ⚠️ Timeout detected ({e}). Retry {current_retry}/{max_retries} in {wait_time}s...")
+                            import asyncio
+                            await asyncio.sleep(wait_time)
+                        else:
+                            raise e
+                
+                # Check for results after management orchestration
+                validated_code = ctx.session.state.get("validated_code")
+                target_node = ctx.session.state.get("target_node")
 
-            # ── Step B: TheHands generates code ───────────────────
-            logger.info(f"  🔧 [{self.research_agent.name}] Generating modified train.py...")
-            
-            async for event in self.research_agent.run_async(ctx):
-                yield event
-            
-            validated_code = ctx.session.state.get("validated_code")
-            if validated_code:
-                logger.info(f"  ✅ Code validated ({len(validated_code)} chars). Writing to disk...")
-                await self.research_agent.driver.mcp.call_tool(
-                    "write_research_file",
-                    {"path": "train.py", "content": validated_code}
+                if validated_code:
+                    if target_node:
+                        logger.info(f"  ✅ Snippet approved. Patching '{target_node}' in train.py...")
+                        await self.manager_agent.hands.driver.mcp.call_tool(
+                            "patch_research_file",
+                            {
+                                "path": "train.py",
+                                "target_node": target_node,
+                                "new_content": validated_code
+                            }
+                        )
+                    else:
+                        logger.info(f"  ✅ Code approved. Writing full train.py...")
+                        await self.manager_agent.hands.driver.mcp.call_tool(
+                            "write_research_file",
+                            {"path": "train.py", "content": validated_code}
+                        )
+                    
+                    # Update local state with the new full file content
+                    ctx.session.state["train_py"] = await self.manager_agent.hands.driver.mcp.call_tool(
+                        "read_research_file", {"path": "train.py"}
+                    )
+                else:
+                    logger.warning("  ⚠️ Code rejected or failed validation. Skipping experiment.")
+                    continue
+
+                # ── Step D: Run the experiment ─────────────────────────
+                logger.info(f"  🚀 Running experiment (iteration {iteration})...")
+                result = await self.manager_agent.hands.driver.run_experiment(f"iteration-{iteration}")
+                await self.manager_agent.hands.driver.log_result(result)
+                
+                prev_bpb = ctx.session.state.get("latest_bpb", 999)
+                ctx.session.state["latest_bpb"] = result.val_bpb
+                
+                # Reload results.tsv for the next brain analysis
+                ctx.session.state["results_tsv"] = await self.manager_agent.hands.driver.mcp.call_tool(
+                    "read_research_file", {"path": "results.tsv"}
                 )
-                ctx.session.state["train_py"] = validated_code
-            else:
-                logger.warning("  ⚠️ Code validation failed. Skipping experiment, retrying next iteration.")
+
+                # ── Step E: Log outcome ───────────────────────────────
+                delta = prev_bpb - result.val_bpb
+                if result.status == "crash":
+                    logger.info(f"  💥 CRASH — reverting to previous code.")
+                    # Revert train.py by re-reading the git version
+                    await self.manager_agent.hands.driver.mcp.call_tool(
+                        "execute_command",
+                        {"command": "git checkout train.py", "cwd": self.manager_agent.hands.driver.repo_path}
+                    )
+                    ctx.session.state["train_py"] = await self.manager_agent.hands.driver.mcp.call_tool(
+                        "read_research_file", {"path": "train.py"}
+                    )
+                elif delta > 0:
+                    logger.info(f"  📈 IMPROVED! val_bpb={result.val_bpb:.4f} (Δ={delta:+.4f})")
+                else:
+                    logger.info(f"  📉 Regressed. val_bpb={result.val_bpb:.4f} (Δ={delta:+.4f})")
+
+                logger.info(f"  📊 Current best: {min(prev_bpb, result.val_bpb):.4f}")
+
+            except Exception as e:
+                logger.error(f"  ❌ Iteration {iteration} FAILED: {e}")
+                logger.info("  🔄 Attempting to recover for next iteration...")
+                # Ensure we have fresh state for next time
+                try:
+                    ctx.session.state["train_py"] = await self.manager_agent.hands.driver.mcp.call_tool(
+                        "read_research_file", {"path": "train.py"}
+                    )
+                except:
+                    pass
                 continue
-
-            # ── Step C: Run the experiment ─────────────────────────
-            logger.info(f"  🚀 Running experiment (iteration {iteration})...")
-            result = await self.research_agent.driver.run_experiment(f"iteration-{iteration}")
-            await self.research_agent.driver.log_result(result)
-            
-            prev_bpb = ctx.session.state.get("latest_bpb", 999)
-            ctx.session.state["latest_bpb"] = result.val_bpb
-            
-            # Reload results.tsv for the next brain analysis
-            ctx.session.state["results_tsv"] = await self.research_agent.driver.mcp.call_tool(
-                "read_research_file", {"path": "results.tsv"}
-            )
-
-            # ── Step D: Log outcome ───────────────────────────────
-            delta = prev_bpb - result.val_bpb
-            if result.status == "crash":
-                logger.info(f"  💥 CRASH — reverting to previous code.")
-                # Revert train.py by re-reading the git version
-                await self.research_agent.driver.mcp.call_tool(
-                    "execute_command",
-                    {"command": "git checkout train.py", "cwd": self.research_agent.driver.repo_path}
-                )
-                ctx.session.state["train_py"] = await self.research_agent.driver.mcp.call_tool(
-                    "read_research_file", {"path": "train.py"}
-                )
-            elif delta > 0:
-                logger.info(f"  📈 IMPROVED! val_bpb={result.val_bpb:.4f} (Δ={delta:+.4f})")
-            else:
-                logger.info(f"  📉 Regressed. val_bpb={result.val_bpb:.4f} (Δ={delta:+.4f})")
-
-            logger.info(f"  📊 Current best: {min(prev_bpb, result.val_bpb):.4f}")
 
         logger.info("═" * 60)
         logger.info(f"  🏁 SWARM CONCLUDED after {self.max_iterations} iterations")

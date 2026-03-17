@@ -54,5 +54,46 @@ async def write_research_file(path: str, content: str, append: bool = False) -> 
     except Exception as e:
         return f"Error writing file: {str(e)}"
 
+@mcp.tool()
+async def patch_research_file(path: str, target_node: str, new_content: str) -> str:
+    """
+    Surgery-style update: Replaces a specific class or function in a file.
+    target_node: Name of the class or function to replace.
+    new_content: The full code of the new class/function.
+    """
+    import ast
+    full_path = os.path.join(SAFE_REPO_PATH, path) if not os.path.isabs(path) else path
+    if not full_path.startswith(SAFE_REPO_PATH):
+        return "Error: Path outside of safe research scope."
+    
+    try:
+        with open(full_path, "r") as f:
+            source = f.read()
+            
+        tree = ast.parse(source)
+        lines = source.splitlines()
+        
+        start_line = -1
+        end_line = -1
+        
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name == target_node:
+                start_line = node.lineno - 1
+                end_line = node.end_lineno
+                break
+        
+        if start_line == -1:
+            return f"Error: Could not find target node '{target_node}' in {path}"
+        
+        # Replace the lines
+        new_lines = lines[:start_line] + new_content.splitlines() + lines[end_line:]
+        
+        with open(full_path, "w") as f:
+            f.write("\n".join(new_lines) + "\n")
+            
+        return f"Successfully patched {target_node} in {path}"
+    except Exception as e:
+        return f"Error patching file: {str(e)}"
+
 if __name__ == "__main__":
     mcp.run()

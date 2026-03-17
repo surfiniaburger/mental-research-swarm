@@ -32,7 +32,8 @@ class ResearchProtocolDriver:
 
     async def ensure_setup(self) -> bool:
         from datetime import datetime
-        tag = datetime.now().strftime("%b%d").lower()
+        # Use a more unique tag: MonthDay-HourMinute
+        tag = datetime.now().strftime("%b%d-%H%M").lower()
         branch_name = f"autoresearch/{tag}"
         
         try:

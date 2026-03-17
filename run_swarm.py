@@ -7,7 +7,7 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
-from swarm.agents import ResearchAgent, SkillWriterAgent
+from swarm.agents import ResearchAgent, SkillWriterAgent, CriticAgent, ManagerAgent
 from swarm.drivers import ResearchProtocolDriver, SkillWriterProtocolDriver
 from swarm.coordinator import SwarmCoordinator
 
@@ -74,6 +74,7 @@ async def main():
                 if name == "execute_command": return await mcp_server.execute_command(**args)
                 if name == "read_research_file": return await mcp_server.read_research_file(**args)
                 if name == "write_research_file": return await mcp_server.write_research_file(**args)
+                if name == "patch_research_file": return await mcp_server.patch_research_file(**args)
                 raise ValueError(f"Unknown tool: {name}")
 
         mcp_client = LocalMCPClient()
@@ -82,21 +83,37 @@ async def main():
         r_driver = ResearchProtocolDriver(mcp_client)
         sw_driver = SkillWriterProtocolDriver(mcp_client)
         
+        # Pull model overrides from env or use Qwen 3.5 defaults
+        MODEL_BRAIN = os.environ.get("BRAIN_MODEL", "ollama/qwen3.5:9b")
+        MODEL_MANAGER = os.environ.get("MANAGER_MODEL", "ollama/qwen3.5:9b")
+        MODEL_HANDS = os.environ.get("HANDS_MODEL", "ollama/qwen2.5-coder:7b")
+        MODEL_CRITIC = os.environ.get("CRITIC_MODEL", "ollama/qwen3.5:9b")
+
         research_agent = ResearchAgent(
             name="TheHands", 
-            model=os.environ.get("USER_LLM_MODEL", "ollama/gemma3:1b"),
+            model=MODEL_HANDS,
             driver=r_driver
         )
         skill_writer = SkillWriterAgent(
             name="TheBrain",
-            model=os.environ.get("SKILL_WRITER_MODEL", "ollama/qwen2.5-coder:3b"),
+            model=MODEL_BRAIN,
             driver=sw_driver
+        )
+        critic_agent = CriticAgent(
+            name="TheCritic",
+            model=MODEL_CRITIC
+        )
+        
+        manager_agent = ManagerAgent(
+            name="MidLevelManager",
+            brain=skill_writer,
+            hands=research_agent,
+            critic=critic_agent
         )
         
         coordinator = SwarmCoordinator(
             name="SwarmCoordinator",
-            research_agent=research_agent,
-            skill_writer=skill_writer
+            manager_agent=manager_agent
         )
 
         # 3. ADK Runner & Session
