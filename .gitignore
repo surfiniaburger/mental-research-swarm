@@ -29,3 +29,31 @@ research_env/data/
 # IDE
 .vscode/
 .idea/
+
+# Logs & Telemetry
+*.log
+swarm*.log
+
+# Taipy Framework
+.taipy/
+
+# Swarm Output / Archives
+research_env/docs/session_state.json
+research_env/docs/archive/
+research_env/docs/current_strategy.md
+research_env/docs/last_critique.md
+research_env/docs/proposed_patch.py
+research_env/docs/research_chronicle.md
+research_env/docs/results_summary.md
+research_env/results.tsv
+research_env/program.md
+
+# Misc Untracked User Data
+user_data/
+chandra/
+*.png
+audit_report.md
+linkedin_post_v2.md
+skilldoc.md
+taipy.md
+

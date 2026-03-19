@@ -57,6 +57,31 @@ class ResearchProtocolDriver:
             })
         return True
 
+    async def get_history(self) -> List[ResearchResult]:
+        """Reads results.tsv and returns a list of ResearchResult objects."""
+        res = await self.mcp.call_tool("read_research_file", {"path": "results.tsv"})
+        history = []
+        if "Error" in res:
+            return history
+            
+        lines = res.strip().split("\n")
+        if len(lines) <= 1: # Header only
+            return history
+            
+        for line in lines[1:]: # Skip header
+            try:
+                parts = line.split("\t")
+                if len(parts) >= 4:
+                    history.append(ResearchResult(
+                        val_bpb=float(parts[1]),
+                        peak_vram_gb=float(parts[2]),
+                        status=parts[3],
+                        description=parts[4] if len(parts) > 4 else ""
+                    ))
+            except Exception as e:
+                logger.warning(f"Error parsing history line: {e}")
+        return history
+
     async def run_experiment(self, description: str) -> ResearchResult:
         await self.mcp.call_tool("execute_command", {
             "command": f'git add train.py && git commit -m "autocommit: {description}"',
@@ -66,7 +91,7 @@ class ResearchProtocolDriver:
         await self.mcp.call_tool("execute_command", {
             "command": "uv run train.py > run.log 2>&1",
             "cwd": self.repo_path,
-            "timeout": 600
+            "timeout": 1200
         })
 
         return await self._parse_metrics("run.log")
@@ -88,6 +113,22 @@ class ResearchProtocolDriver:
             status="keep" if val_bpb > 0 else "crash",
             description="Experiment run"
         )
+
+    async def read_crash_log(self, max_lines: int = 30) -> str:
+        """Read the last N lines of run.log for crash diagnosis feedback.
+        
+        Returns the tail of the log so the Brain/Hands can learn from failures
+        instead of blindly repeating the same broken patterns.
+        """
+        try:
+            content = await self.mcp.call_tool("read_research_file", {"path": "run.log"})
+            if not content or not content.strip():
+                return ""
+            lines = content.strip().split("\n")
+            tail = lines[-max_lines:]
+            return "\n".join(tail)
+        except Exception:
+            return ""
 
 class SkillWriterProtocolDriver:
     """

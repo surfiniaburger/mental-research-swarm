@@ -1,34 +1,144 @@
 import logging
 import ast
 import os
-from typing import AsyncGenerator, Any, Optional
+from typing import AsyncGenerator, Any, Optional, List
 from google.adk.agents import LlmAgent, BaseAgent
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events import Event
 from .prompt import PromptEnvelope, build_prompt_messages
 from .drivers import ResearchProtocolDriver, ResearchResult, SkillWriterProtocolDriver
+from .telemetry import token_telemetry_callback
 
 logger = logging.getLogger(__name__)
+
+class AntiRedundancyFilter:
+    """🛡️ Identifies research stagnation by monitoring performance deltas."""
+    def __init__(self, threshold: float = 0.005, window: int = 3):
+        self.threshold = threshold
+        self.window = window
+
+    def check(self, history: List[ResearchResult]) -> bool:
+        """Returns True if the last 'window' results show no improvement above 'threshold'."""
+        if len(history) < self.window:
+            return False
+        
+        # Look at the last 'window' results
+        recent = history[-self.window:]
+        bpbs = [r.val_bpb for r in recent if r.val_bpb > 0]
+        
+        if len(bpbs) < self.window:
+            return False
+            
+        # Calculate max improvement spread in this window
+        # We assume lower BPB is better. 
+        # So we look at max(bpbs) - min(bpbs)
+        max_delta = max(bpbs) - min(bpbs)
+        return max_delta < self.threshold
+
+
+from dataclasses import dataclass
+
+@dataclass
+class DiversifierResult:
+    """Communicates the outcome of a diversifier check."""
+    allowed: bool
+    category: str
+    reason: str = ""
+
+
+class StrategyDiversifier:
+    """🎯 Prevents the Brain from proposing the same category of change repeatedly.
+    
+    Tracks strategy categories across iterations. If the same category
+    appears more than `max_streak` times consecutively, the strategy is rejected
+    to force exploration of different research axes.
+    """
+    
+    # Category keywords — each list defines a research axis
+    CATEGORY_KEYWORDS = {
+        "optimizer": ["optimizer", "adam", "adamw", "sgd", "learning_rate", "lr_scheduler",
+                      "cosineanneal", "reducelronplateau", "configure_optimizers", "weight_decay",
+                      "momentum", "warmup", "eta_min", "t_mult"],
+        "attention": ["attention", "self_attention", "multi_head", "flash_attention",
+                      "kv_cache", "rotary", "rope", "alibi", "causal_mask"],
+        "architecture": ["transformer", "layer_norm", "feedforward", "mlp", "embedding",
+                         "positional", "residual", "dropout", "hidden_dim", "num_layers",
+                         "num_heads", "expert", "moe", "gating"],
+        "loss": ["loss", "cross_entropy", "label_smoothing", "distillation",
+                 "auxiliary_loss", "regularization", "l2_norm", "entropy"],
+        "data": ["batch_size", "sequence_length", "tokenizer", "curriculum",
+                 "data_augmentation", "sampling", "shuffle"],
+    }
+    
+    def __init__(self, max_streak: int = 2):
+        self.max_streak = max_streak
+        self.history: List[str] = []
+    
+    def classify(self, strategy_text: str) -> str:
+        """Classify a strategy into a research category based on keyword density."""
+        text_lower = strategy_text.lower()
+        scores = {}
+        for category, keywords in self.CATEGORY_KEYWORDS.items():
+            scores[category] = sum(1 for kw in keywords if kw in text_lower)
+        
+        best_category = max(scores, key=scores.get)
+        return best_category if scores[best_category] > 0 else "unknown"
+    
+    def check(self, strategy_text: str) -> DiversifierResult:
+        """Check if a strategy should be allowed based on category diversity.
+        
+        Returns a DiversifierResult with allowed=True/False and the detected category.
+        """
+        category = self.classify(strategy_text)
+        
+        # Always allow if we don't have enough history
+        if len(self.history) < self.max_streak:
+            self.history.append(category)
+            return DiversifierResult(allowed=True, category=category)
+        
+        # Check if the last max_streak entries are all the same category
+        recent = self.history[-self.max_streak:]
+        is_streak = all(c == category for c in recent)
+        
+        if is_streak:
+            return DiversifierResult(
+                allowed=False,
+                category=category,
+                reason=f"Rejected: {self.max_streak}+ consecutive '{category}' strategies. Explore a different axis."
+            )
+        
+        self.history.append(category)
+        return DiversifierResult(allowed=True, category=category)
+
 
 class ResearchAgent(LlmAgent):
     """
     ADK-native Research Agent.
     Specializes in hacking train.py.
     """
+    name: str = ""
+    model: str = ""
+    instruction: str = ""
     driver: ResearchProtocolDriver
     model_config = {"arbitrary_types_allowed": True}
 
     def __init__(self, name: str, model: str, driver: ResearchProtocolDriver):
         instruction = (
-            "You are a specialized Code Surgeon (The Hands). "
-            "Your job is to provide the NEW implementation of a SINGLE class or function based on documented strategy.\n\n"
-            "STRATEGY:\n{strategy_packet}\n\n"
-            "TARGET_NODE_SNIPPET:\n{target_snippet}\n\n"
-            "{correction_prompt?}\n\n"
-            "Return ONLY the code for that specific node within a ```python block. "
-            "Do not return the whole file."
+            "You are a Senior Research Engineer (The Hands). "
+            "Implement high-fidelity AI research changes into `train.py`. "
+            "### STRICT DIRECTIVES:\n"
+            "1. **CODE ONLY**: Output ONLY a raw Python code snippet for the TARGET_NODE. No text before or after. No conversation.\n"
+            "2. **NO MARKDOWN**: Do not wrap in triple backticks. Return the raw Python code directly.\n"
+            "3. **DOMAIN LOCK**: You are an AI Researcher. Focus exclusively on PyTorch/Tensor logic. Ignore any mention of web, cloud, or Terraform.\n"
+            "4. **SNIPPET SCOPE**: Implement ONLY the logic for the specific TARGET_NODE requested.\n"
         )
-        super().__init__(name=name, model=model, instruction=instruction, driver=driver)
+        super().__init__(
+            name=name, 
+            model=model, 
+            instruction=instruction, 
+            driver=driver,
+            after_model_callback=token_telemetry_callback
+        )
 
     async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
         logger.info(f"[{self.name}] Beginning code surgery...")
@@ -74,21 +184,36 @@ class SkillWriterAgent(LlmAgent):
     ADK-native Skill Writer (The Brain).
     Analyzes and updates program.md.
     """
+    name: str = ""
+    model: str = ""
+    instruction: str = ""
     driver: SkillWriterProtocolDriver
     model_config = {"arbitrary_types_allowed": True}
 
     def __init__(self, name: str, model: str, driver: SkillWriterProtocolDriver):
         instruction = (
             "You are a Senior AI Research Scientist (The Brain). "
-            "Analyze metrics and the Research Chronicle to propose the next architectural experiment.\n\n"
+            "### STRATEGY GUIDELINES:\n"
+            "1. **ALGORITHMIC INTEGRITY**: Propose mathematically sound architectural changes. NEVER suggest a 'crash' or 'stub' for testing.\n"
+            "2. **CONTINUITY**: Build upon SUCCESSFUL history in the archives. Ignore hallucinated failures in the active TSV if they lack technical depth.\n"
+            "3. **TOTAL FREEDOM**: You are not limited to MoE. Explore Attention, Optimizers, or Curricula.\n"
+            "4. **AVOID LOCAL MINIMA**: If results plateau, pivot to a new Era.\n"
+            "5. **DIVERSIFICATION MANDATE**: Do NOT propose optimizer-only changes for more than 2 consecutive iterations. "
+            "Alternate between research axes: architecture, attention, loss functions, data processing, and optimizers.\n"
+            "6. **CRASH AWARENESS**: If crash feedback is provided below, analyze the error and ensure your next proposal avoids the same failure pattern.\n\n"
             "RESULTS:\n{results_packet}\n\n"
             "CHRONICLE:\n{research_chronicle}\n\n"
             "FULL_STRATEGY:\n{strategy_packet}\n\n"
-            "Your goal is to avoid 'Local Minima'. If recent iterations show diminishing returns, "
-            "pivot to an entirely different architectural sub-system (e.g., from Attention to FFN). "
+            "CRASH_FEEDBACK:\n{crash_feedback}\n\n"
             "Return target node as: TARGET_NODE: [NodeName]"
         )
-        super().__init__(name=name, model=model, instruction=instruction, driver=driver)
+        super().__init__(
+            name=name, 
+            model=model, 
+            instruction=instruction, 
+            driver=driver,
+            after_model_callback=token_telemetry_callback
+        )
 
     async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
         logger.info(f"[{self.name}] Analyzing results via shared documents...")
@@ -109,6 +234,9 @@ class CriticAgent(LlmAgent):
     ADK-native Code Critic.
     Reviews train.py for logical errors and alignment with strategy.
     """
+    name: str = ""
+    model: str = ""
+    instruction: str = ""
     model_config = {"arbitrary_types_allowed": True}
 
     def __init__(self, name: str, model: str):
@@ -122,7 +250,12 @@ class CriticAgent(LlmAgent):
             "successful versions but doesn't offer a clear theoretical breakthrough, REJECT it. "
             "Start your response with 'APPROVE' or 'REJECT'."
         )
-        super().__init__(name=name, model=model, instruction=instruction)
+        super().__init__(
+            name=name, 
+            model=model, 
+            instruction=instruction,
+            after_model_callback=token_telemetry_callback
+        )
 
     async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
         logger.info(f"[{self.name}] Reviewing surgical patch...")
@@ -144,19 +277,23 @@ class ManagerAgent(BaseAgent):
     Orchestrates the Brain, Hands, and Critic.
     Implements 'Contextual Packets' for efficient communication.
     """
-    brain: BaseAgent
-    hands: BaseAgent
-    critic: BaseAgent
+    brain: Any = None
+    hands: Any = None
+    critic: Any = None
+    redundancy_filter: Any = None
+    strategy_diversifier: Any = None
     model_config = {"arbitrary_types_allowed": True}
 
     def __init__(self, name: str, brain: BaseAgent, hands: BaseAgent, critic: BaseAgent):
         super().__init__(
             name=name,
-            sub_agents=[brain, hands, critic],
-            brain=brain,
-            hands=hands,
-            critic=critic
+            sub_agents=[brain, hands, critic]
         )
+        self.brain = brain
+        self.hands = hands
+        self.critic = critic
+        self.redundancy_filter = AntiRedundancyFilter(threshold=0.005, window=3)
+        self.strategy_diversifier = StrategyDiversifier(max_streak=2)
         self._fibonacci_cache = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144]
 
     def _is_fibonacci(self, n: int) -> bool:
@@ -168,6 +305,13 @@ class ManagerAgent(BaseAgent):
         docs_dir = os.path.join(research_dir, "docs")
         os.makedirs(docs_dir, exist_ok=True)
 
+        # 0. Load Mission Anchor (Immutable Context)
+        mission_path = os.path.join(docs_dir, "MISSION.md")
+        mission_content = ""
+        if os.path.exists(mission_path):
+            with open(mission_path, "r") as f:
+                mission_content = f.read()
+        
         # 1. Summarize Results (last 5 entries)
         results = ctx.session.state.get("results_tsv", "")
         if results:
@@ -175,6 +319,11 @@ class ManagerAgent(BaseAgent):
             header = lines[0]
             last_entries = lines[-5:]
             results_packet = f"{header}\n" + "\n".join(last_entries)
+            
+            # Prepend mission to results packet
+            if mission_content:
+                results_packet = f"### PRIMARY MISSION ###\n{mission_content}\n\n### RECENT RESULTS ###\n{results_packet}"
+            
             ctx.session.state["results_packet"] = results_packet
             with open(os.path.join(docs_dir, "results_summary.md"), "w") as f:
                 f.write(f"# Results Summary\n\n{results_packet}")
@@ -203,18 +352,50 @@ class ManagerAgent(BaseAgent):
             with open(chronicle_path, "w") as f:
                 f.write("# Research Chronicle\n\n## Era 1: Initial Baseline\nSetting up the environment and establishing dense performance metrics.")
         
+        # [ANNEALING] Check for stagnation and prune context harder
+        results = ctx.session.state.get("results_tsv", "")
+        is_stagnant = False
+        if results:
+            lines = [l for l in results.strip().split("\n") if l.strip()]
+            if len(lines) > 4:
+                # Calculate delta over last 3 iterations
+                try:
+                    vals = [float(l.split()[1]) for l in lines[-3:] if len(l.split()) > 1]
+                    if len(vals) == 3 and abs(vals[0] - vals[2]) < 0.005:
+                        is_stagnant = True
+                except (ValueError, IndexError):
+                    pass
+
         with open(chronicle_path, "r") as f:
             content = f.read()
-            # Recursive Compression: If chronicle > 3000 chars, prune old eras but keep summaries
-            if len(content) > 3000:
-                logger.info(f"[{self.name}] Chronicle exceeds 3000 chars. Pruning for context efficiency...")
+            # Recursive Compression: If chronicle > 3000 chars OR stagnant, prune old eras
+            if len(content) > 3000 or is_stagnant:
+                logger.info(f"[{self.name}] Stagnation or Size Limit detected. Performing Context Annealing...")
                 lines = content.split("\n")
-                # Keep Header + Last 15 lines of context
-                content = lines[0] + "\n\n... (Earlier Eras archived in docs/archive/) ...\n\n" + "\n".join(lines[-20:])
+                # Keep Header + Last 10 lines of context (Harder pruning during stagnation)
+                keep_lines = 10 if is_stagnant else 20
+                content = lines[0] + f"\n\n... (Stagnation Annealing Pruned Earlier Context) ...\n\n" + "\n".join(lines[-keep_lines:])
+                
+                # If stagnant, also WIPE the last critique to avoid negative roleplay loops
+                if is_stagnant and os.path.exists(os.path.join(docs_dir, "last_critique.md")):
+                    with open(os.path.join(docs_dir, "last_critique.md"), "w") as fc:
+                        fc.write("# Strategic Annealing\nStagnation detected. Previous critiques purged to allow fresh architectural perspective.")
             
             ctx.session.state["research_chronicle"] = content
 
+        # 5. Dynamic Skill Loading (DEPRECATED)
+        pass
+
+        # Dynamic Skill Loading (DEPRECATED: Swarm now leads itself)
+        pass
+
     async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
+        # Reset iteration state to prevent stale code from previous iterations being applied
+        ctx.session.state["validated_code"] = None
+        ctx.session.state["ast_error"] = None
+        ctx.session.state["critic_feedback"] = None
+        ctx.session.state["target_node"] = None
+        
         logger.info(f"[{self.name}] Orchestrating research loop with Contextual Packets...")
         
         self._prepare_contextual_packets(ctx)
@@ -223,32 +404,61 @@ class ManagerAgent(BaseAgent):
         iteration = ctx.session.state.get("iteration", 1)
         logger.info(f"[{self.name}] Step 1: Brain (Strategy Update - Iteration {iteration})")
         
-        # Innovation Pulse: Detect stagnation
-        results = ctx.session.state.get("results_tsv", "")
-        break_circle = False
-        if results:
-            lines = results.strip().split("\n")
-            if len(lines) >= 3:
-                try:
-                    vals = [float(l.split("\t")[1]) for l in lines[-2:]]
-                    delta = abs(vals[0] - vals[1])
-                    if delta < 0.0005:
-                        break_circle = True
-                        logger.warning(f"[{self.name}] Innovation Pulse triggered: Delta {delta:.6f} is below threshold.")
-                except:
-                    pass
-
-        if break_circle:
-             ctx.session.state["results_packet"] += "\n\nCRITICAL: STAGNATION DETECTED. You MUST BREAK THE CIRCLE and target a NEW module."
+        # 🛡️ ANTI-REDUNDANCY FILTER
+        history = await self.hands.driver.get_history()
+        if self.redundancy_filter.check(history):
+            logger.warning(f"[{self.name}] Stagnation detected. Triggering Anti-Redundancy rejection.")
+            yield Event(
+                name="CriticFeedback",
+                data={
+                    "feedback": (
+                        "### Evaluation Result: REJECT (Failed Anti-Redundancy Filter)\n\n"
+                        "**Reasoning:**\n"
+                        "1. **Redundancy Analysis**: Performance delta has dropped below 0.005 across the last 3 iterations.\n"
+                        "2. **Stagnation**: Research has plateaued. Re-submitting structural variations of existing logic is redundant.\n"
+                        "3. **Feedback**: Please provide specific deviations or a new theoretical adjustment to break the plateau."
+                    )
+                }
+            )
+            # Prune context even harder to force a pivot
+            self._prepare_contextual_packets(ctx)
+            if "research_chronicle" in ctx.session.state:
+                lines = ctx.session.state["research_chronicle"].split("\n")
+                ctx.session.state["research_chronicle"] = lines[0] + "\n\n!!! CRITICAL STAGNATION !!!\nPruning history to force a radical pivot.\n" + "\n".join(lines[-5:])
+            return
 
         async for event in self.brain.run_async(ctx):
             yield event
             
         brain_out = ctx.session.state.get(self.brain.output_key, "")
         if brain_out:
-            await self.brain.driver.update_skill(brain_out)
+            # Domain Guard: Check for severe hallucinations (e.g. AWS/Terraform/FastAPI)
+            hallucination_keywords = ["aws", "terraform", "fastapi", "ec2", "s3", "docker-compose", "hcl", "instance_type"]
+            found_hallucinations = [kw for kw in hallucination_keywords if kw in brain_out.lower()]
+            if found_hallucinations:
+                logger.error(f"[{self.name}] DOMAIN CORRUPTION DETECTED: Brain is discussing {found_hallucinations}. ABORTING UPDATE.")
+                # Self-Healing: Invalidate the bad strategy and inject a corrective mission
+                ctx.session.state[self.brain.output_key] = "[REJECTED: Domain Corruption]"
+                ctx.session.state["strategy_packet"] = "ERROR: Previous strategy rejected for domain shift. STICK TO AI RESEARCH ONLY."
+                return # Skip this iteration's surgery and chronicle update
+
+            # 🎯 STRATEGY DIVERSIFIER: Check if Brain is stuck on one axis
+            div_result = self.strategy_diversifier.check(brain_out)
+            if not div_result.allowed:
+                logger.warning(f"[{self.name}] Strategy Diversifier REJECTED: {div_result.reason}")
+                ctx.session.state["strategy_packet"] += (
+                    f"\n\n⚠️ DIVERSIFICATION REQUIRED: Your last {self.strategy_diversifier.max_streak} strategies "
+                    f"were all '{div_result.category}'. You MUST explore a different research axis "
+                    f"(e.g., attention, architecture, loss, data). Optimizer changes will be auto-rejected."
+                )
+                # Don't return — let the Brain re-run with the diversification feedback
+                # but skip the skill update to avoid writing stale strategy
+            else:
+                logger.info(f"[{self.name}] Strategy category: '{div_result.category}' (allowed)")
+                await self.brain.driver.update_skill(brain_out)
             
             # Fibonacci Strategic Checkpoint (Era Shift)
+            iteration = ctx.session.state.get("iteration", 1)
             if self._is_fibonacci(iteration):
                 logger.info(f"[{self.name}] Fibonacci Milestone reached (Iter {iteration}). Archiving Era...")
                 research_dir = ctx.session.state.get("research_dir", "research_env")
@@ -272,9 +482,26 @@ class ManagerAgent(BaseAgent):
 
             ctx.session.state["strategy_summary"] = brain_out[:200] + "..."
             
+            # Domain Guard: Check for severe hallucinations (e.g. AWS/Terraform/FastAPI)
+            hallucination_keywords = ["aws", "terraform", "fastapi", "ec2", "s3", "lambda", "docker-compose"]
+            found_hallucinations = [kw for kw in hallucination_keywords if kw in brain_out.lower()]
+            if found_hallucinations:
+                logger.error(f"[{self.name}] DOMAIN CORRUPTION DETECTED: Brain is discussing {found_hallucinations}. Triggering Self-Healing...")
+                # Force a strategic pivot and clear the bad strategy
+                ctx.session.state["results_packet"] += "\n\nCRITICAL ERROR: YOUR PREVIOUS STRATEGY WAS REJECTED FOR DOMAIN CORRUPTION. FOCUS ON AI RESEARCH ONLY."
+                ctx.session.state["strategy_packet"] = "Domain Corruption Detected. Reverting to base AI research strategy."
+                return # Skip this iteration's surgery
+
             # Extract Target Node for snippet-based editing
-            if "TARGET_NODE:" in brain_out:
-                target = brain_out.split("TARGET_NODE:")[1].split("\n")[0].strip()
+            # Proactive Chat Filter: Strip roleplay markers and emojis before processing
+            import re
+            filtered_out = re.sub(r'[🚨🟢🫡🧪🏢🏢🏗️🔬📊📊🧬🌀🃏💓📘🛡️]', '', brain_out)
+            filtered_out = re.sub(r'System Status Update.*|Operator Update.*|Command Center.*', '', filtered_out, flags=re.IGNORECASE)
+            
+            if "TARGET_NODE:" in filtered_out:
+                target = filtered_out.split("TARGET_NODE:")[1].split("\n")[0].strip()
+                # Strip markdown bold markers ** that LLMs often use
+                target = target.strip("*").strip()
                 ctx.session.state["target_node"] = target
                 logger.info(f"[{self.name}] Surgery Target identified: {target}")
             else:
@@ -297,8 +524,12 @@ class ManagerAgent(BaseAgent):
                             break
                     else:
                         ctx.session.state["target_snippet"] = "Node not found in source."
-                except:
+                except (SyntaxError, IndexError) as e:
+                    logger.error(f"[{self.name}] Error extracting snippet for surgery: {e}")
                     ctx.session.state["target_snippet"] = "Error extracting snippet."
+            
+            # Skill discovered removed.
+            pass
             
         # 2. Ask Hands for code implementation
         max_correction_attempts = 2

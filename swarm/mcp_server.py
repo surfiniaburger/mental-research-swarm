@@ -85,8 +85,18 @@ async def patch_research_file(path: str, target_node: str, new_content: str) -> 
         if start_line == -1:
             return f"Error: Could not find target node '{target_node}' in {path}"
         
-        # Replace the lines
-        new_lines = lines[:start_line] + new_content.splitlines() + lines[end_line:]
+        # Replace the lines with indentation awareness
+        import textwrap
+        # Calculate original indentation
+        original_line = lines[start_line]
+        indent_size = len(original_line) - len(original_line.lstrip())
+        original_indent = original_line[:indent_size]
+        
+        # Dedent the new content to a clean baseline, then re-indent to match target
+        dedented_new_content = textwrap.dedent(new_content)
+        indented_new_content = textwrap.indent(dedented_new_content.strip(), original_indent)
+        
+        new_lines = lines[:start_line] + indented_new_content.splitlines() + lines[end_line:]
         
         with open(full_path, "w") as f:
             f.write("\n".join(new_lines) + "\n")
